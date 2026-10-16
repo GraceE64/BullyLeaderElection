@@ -6,16 +6,19 @@ import time
 from datetime import datetime
 
 HOST = "127.0.0.1"
-PORT_START = 5000
-NODES = list(range(1, 6))
+BASE_PORT = 5000
+NODES = [1, 2, 3, 4, 5]
+
 PING_INTERVAL = 3
-TIMEOUT = 2
+SOCKET_TIMEOUT = 2
+COORDINATOR_TIMEOUT = 6
 
 node_id = 0
 leader_id = None
-leader_lock = threading.Lock()
+
+state_lock = threading.Lock()
 election_lock = threading.Lock()
-leader_event = threading.Event()
+coordinator_event = threading.Event()
 
 
 def log(message):
@@ -24,85 +27,98 @@ def log(message):
 
 
 def send_message(target, message):
+    """Send one JSON message and read the reply."""
     try:
         with socket.create_connection(
-            (HOST, PORT_START + target), timeout=TIMEOUT
+            (HOST, BASE_PORT + target), timeout=SOCKET_TIMEOUT
         ) as sock:
-            sock.settimeout(TIMEOUT)
+            sock.settimeout(SOCKET_TIMEOUT)
             sock.sendall((json.dumps(message) + "\n").encode("utf-8"))
-            with sock.makefile("r", encoding="utf-8") as stream:
-                reply = stream.readline()
 
-        return json.loads(reply) if reply else None
+            with sock.makefile("r", encoding="utf-8") as stream:
+                reply_line = stream.readline()
+
+        if not reply_line:
+            return None
+        return json.loads(reply_line)
+
     except (OSError, ValueError, json.JSONDecodeError):
         return None
 
 
 def announce_leader():
+    """Tell every other node that this node is the leader."""
     global leader_id
 
-    with leader_lock:
+    with state_lock:
         leader_id = node_id
-    leader_event.set()
-    log("I am the leader")
+    coordinator_event.set()
+    log("I am the new leader")
 
-    for other in NODES:
-        if other != node_id:
-            send_message(other, {"type": "COORDINATOR", "sender": node_id})
+    for target in NODES:
+        if target != node_id:
+            send_message(
+                target, {"type": "COORDINATOR", "sender": node_id}
+            )
 
 
 def start_election():
+    """Run the Bully election process for this node."""
+    global leader_id
+
     if not election_lock.acquire(blocking=False):
         return
 
     try:
         while True:
-            log("Starting election")
-            leader_event.clear()
-            received_ok = False
+            log("Starting Bully election")
+            coordinator_event.clear()
 
-            for other in NODES:
-                if other <= node_id:
-                    continue
+            higher_nodes = [n for n in NODES if n > node_id]
+            got_ok = False
 
+            for target in higher_nodes:
                 reply = send_message(
-                    other, {"type": "ELECTION", "sender": node_id}
+                    target, {"type": "ELECTION", "sender": node_id}
                 )
                 if reply and reply.get("type") == "OK":
-                    received_ok = True
-                    log(f"Node {other} replied OK")
+                    got_ok = True
+                    log(f"Node {target} replied OK")
 
-            if not received_ok:
+            if not got_ok:
                 announce_leader()
                 return
 
             log("Waiting for a coordinator message")
-            leader_event.wait(6)
+            coordinator_event.wait(COORDINATOR_TIMEOUT)
 
-            with leader_lock:
+            with state_lock:
                 current_leader = leader_id
 
             if current_leader is not None and current_leader > node_id:
                 return
 
-            log("No leader announcement received; starting again")
+            log("No higher coordinator received; retrying election")
+
     finally:
         election_lock.release()
 
 
-def receive_message(sock):
-    with sock.makefile("r", encoding="utf-8") as stream:
+def read_message(conn):
+    with conn.makefile("r", encoding="utf-8") as stream:
         line = stream.readline()
     return json.loads(line) if line else None
 
 
-def handle_client(sock):
-    start_new_election = False
+def handle_message(conn):
+    global leader_id
+    start_another_election = False
 
-    with sock:
+    with conn:
         try:
-            sock.settimeout(TIMEOUT)
-            message = receive_message(sock)
+            conn.settimeout(SOCKET_TIMEOUT)
+            message = read_message(conn)
+
             if not message:
                 return
 
@@ -112,17 +128,15 @@ def handle_client(sock):
 
             if kind == "ELECTION":
                 reply = {"type": "OK", "sender": node_id}
-                start_new_election = True
+                start_another_election = True
 
             elif kind == "COORDINATOR":
-                global leader_id
-                with leader_lock:
-                    if sender > node_id and (
-                        leader_id is None or sender >= leader_id
-                    ):
-                        leader_id = sender
-                        leader_event.set()
-                        log(f"Leader is Node {sender}")
+                if sender > node_id:
+                    with state_lock:
+                        if leader_id is None or sender >= leader_id:
+                            leader_id = sender
+                            coordinator_event.set()
+                            log(f"Leader announced: Node {sender}")
                 reply = {"type": "ACK", "sender": node_id}
 
             elif kind == "PING":
@@ -131,25 +145,27 @@ def handle_client(sock):
             else:
                 reply = {"type": "ACK", "sender": node_id}
 
-            sock.sendall((json.dumps(reply) + "\n").encode("utf-8"))
+            conn.sendall((json.dumps(reply) + "\n").encode("utf-8"))
+
         except (OSError, ValueError, json.JSONDecodeError):
             log("Could not process the message")
+            return
 
-    if start_new_election:
+    if start_another_election:
         threading.Thread(target=start_election, daemon=True).start()
 
 
 def listen_for_nodes():
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server.bind((HOST, PORT_START + node_id))
+        server.bind((HOST, BASE_PORT + node_id))
         server.listen()
-        log(f"Listening on port {PORT_START + node_id}")
+        log(f"Listening on port {BASE_PORT + node_id}")
 
         while True:
-            client, _ = server.accept()
+            conn, _ = server.accept()
             threading.Thread(
-                target=handle_client, args=(client,), daemon=True
+                target=handle_message, args=(conn,), daemon=True
             ).start()
 
 
@@ -158,7 +174,8 @@ def monitor_leader():
 
     while True:
         time.sleep(PING_INTERVAL)
-        with leader_lock:
+
+        with state_lock:
             current_leader = leader_id
 
         if current_leader is None or current_leader == node_id:
@@ -170,10 +187,12 @@ def monitor_leader():
         if reply and reply.get("type") == "PONG":
             continue
 
-        log(f"Node {current_leader} is not responding")
-        with leader_lock:
+        log(f"Leader Node {current_leader} did not respond")
+
+        with state_lock:
             if leader_id == current_leader:
                 leader_id = None
+
         start_election()
 
 
@@ -187,17 +206,18 @@ def main():
     try:
         node_id = int(sys.argv[1])
     except ValueError:
-        print("Please enter a node ID from 1 to 5.")
+        print("Node ID must be an integer from 1 to 5.")
         raise SystemExit(1)
 
     if node_id not in NODES:
-        print("Please enter a node ID from 1 to 5.")
+        print("Node ID must be between 1 and 5.")
         raise SystemExit(1)
 
     log("Starting")
     threading.Thread(target=listen_for_nodes, daemon=True).start()
     time.sleep(0.5)
     threading.Thread(target=monitor_leader, daemon=True).start()
+
     start_election()
     threading.Event().wait()
 
